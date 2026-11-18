@@ -1,0 +1,87 @@
+#!/bin/sh
+# shellcheck shell=ash
+#
+# rpcd exec plugin for luci-app-weaver (ubus object luci.weaver):
+#   status  the daemon's `weaver status --json`, or {"error": ...} when it
+#           isn't running
+#   pubkey  this router's public key, from weaver.main.private_key
+#   genkey  a fresh private/public pair, for setting up a peer; nothing is
+#           stored here
+
+# shellcheck source=/dev/null
+. /usr/share/libubox/jshn.sh
+
+WEAVER=/usr/bin/weaver
+
+reply_error() { # message [detail]
+	json_init
+	json_add_string error "$1"
+	[ -n "$2" ] && json_add_string detail "$2"
+	if [ "$(uci -q get weaver.main.enabled)" = 1 ]; then
+		json_add_boolean enabled 1
+	else
+		json_add_boolean enabled 0
+	fi
+	json_dump
+}
+
+pubkey_of() {
+	printf '%s\n' "$1" | "$WEAVER" pubkey 2>/dev/null
+}
+
+case "$1" in
+list)
+	echo '{ "status": {}, "pubkey": {}, "genkey": {} }'
+	;;
+call)
+	if [ ! -x "$WEAVER" ]; then
+		reply_error "weaver is not installed"
+		exit 0
+	fi
+	case "$2" in
+	status)
+		sock=$(uci -q get weaver.main.control_socket)
+		[ -n "$sock" ] || sock=/var/run/weaver.sock
+		out=$("$WEAVER" status --json --socket "$sock" 2>&1)
+		rc=$?
+		trimmed=$(printf '%s' "$out" | tr -d ' \t\n\r' | cut -c1)
+		if [ "$rc" = 0 ] && [ "$trimmed" = "{" ]; then
+			printf '%s\n' "$out"
+		else
+			reply_error "not running" "$out"
+		fi
+		;;
+	pubkey)
+		key=$(uci -q get weaver.main.private_key)
+		if [ -z "$key" ]; then
+			reply_error "no private key"
+			exit 0
+		fi
+		pub=$(pubkey_of "$key")
+		if [ -z "$pub" ]; then
+			reply_error "cannot derive the public key from weaver.main.private_key"
+			exit 0
+		fi
+		json_init
+		json_add_string public_key "$pub"
+		json_dump
+		;;
+	genkey)
+		priv=$("$WEAVER" genkey 2>/dev/null)
+		pub=""
+		[ -n "$priv" ] && pub=$(pubkey_of "$priv")
+		if [ -z "$pub" ]; then
+			reply_error "weaver genkey failed"
+			exit 0
+		fi
+		json_init
+		json_add_string private_key "$priv"
+		json_add_string public_key "$pub"
+		json_dump
+		;;
+	*)
+		reply_error "unknown method $2"
+		;;
+	esac
+	;;
+esac

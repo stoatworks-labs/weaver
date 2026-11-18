@@ -1,0 +1,40 @@
+# weaver server on a VPS. Copy next to a checkout, adjust WEAVER_PEERS, then:
+#   docker compose -f container/compose.example.yml up -d --build
+#   docker compose -f container/compose.example.yml logs weaver   # public key
+# See docs/CONTAINER.md.
+
+services:
+  weaver:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: weaver:local
+    container_name: weaver
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    ports:
+      - "9328:9328/udp"
+    volumes:
+      # private.key lives here: keep it, or every client needs a new
+      # server public key.
+      - weaver-data:/var/lib/weaver
+    environment:
+      WEAVER_ROLE: server
+      WEAVER_LISTEN_PORT: "9328"
+      WEAVER_ADDRESS: 10.77.0.1/24
+      WEAVER_LOG_LEVEL: info
+      # One client per line: name,public key,tunnel address[,allowed ip...]
+      # Start once without it to get the server's public key from the logs,
+      # then uncomment, fill in the clients' keys and `up -d` again. weaver
+      # refuses to start while a key here is not a valid one.
+      # WEAVER_PEERS: |
+      #   flint,<flint's public key>,10.77.0.2
+      #   beryl,<beryl's public key>,10.77.0.3,192.168.9.0/24
+
+volumes:
+  weaver-data:

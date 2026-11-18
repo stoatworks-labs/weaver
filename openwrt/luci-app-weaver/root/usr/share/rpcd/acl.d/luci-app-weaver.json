@@ -1,0 +1,17 @@
+{
+	"luci-app-weaver": {
+		"description": "Grant access to weaver status and settings",
+		"read": {
+			"ubus": {
+				"luci.weaver": [ "status", "pubkey" ]
+			},
+			"uci": [ "weaver" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.weaver": [ "genkey" ]
+			},
+			"uci": [ "weaver" ]
+		}
+	}
+}

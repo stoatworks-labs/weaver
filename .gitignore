@@ -1,0 +1,4 @@
+# scripts/build.sh and scripts/build-ipk.sh output
+/dist/
+# per-session worktrees (see the fleet working rules)
+/.claude/

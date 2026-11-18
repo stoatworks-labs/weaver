@@ -1,0 +1,126 @@
+#!/bin/sh
+# shellcheck shell=ash
+#
+# /etc/uci-defaults/90-weaver: first-run setup for weaver. Safe to run again;
+# it only adds what is missing.
+#
+#   - a private key in weaver.main.private_key
+#   - netifd interface 'weaver' (proto none, device weaver0), so the firewall
+#     can put the tunnel in a zone
+#   - firewall zone 'weaver' (accept, masquerade, MSS clamping), forwardings
+#     lan -> weaver (client) and weaver -> wan (server), and the
+#     Allow-Weaver rule for udp/9328, disabled: /etc/init.d/weaver enables
+#     it while the router runs as a server.
+#
+# Run from /etc/init.d/boot on first boot, or by opkg's postinst (both source
+# it in a subshell and delete it when it returns 0).
+
+weaver_net_changed=0
+weaver_fw_changed=0
+
+# fw_find TYPE OPTION VALUE: the first firewall section of TYPE whose OPTION
+# is VALUE.
+fw_find() {
+	for s in $(uci -q -X show firewall | sed -n "s/^firewall\.\([^.=]*\)=$1\$/\1/p"); do
+		[ "$(uci -q get "firewall.$s.$2")" = "$3" ] && {
+			echo "$s"
+			return 0
+		}
+	done
+	return 1
+}
+
+fw_has_forwarding() { # src dest
+	for s in $(uci -q -X show firewall | sed -n "s/^firewall\.\([^.=]*\)=forwarding\$/\1/p"); do
+		[ "$(uci -q get "firewall.$s.src")" = "$1" ] &&
+			[ "$(uci -q get "firewall.$s.dest")" = "$2" ] && return 0
+	done
+	return 1
+}
+
+# --- key ---------------------------------------------------------------------
+
+[ "$(uci -q get weaver.main)" = weaver ] || uci -q set weaver.main=weaver
+if [ -z "$(uci -q get weaver.main.private_key)" ]; then
+	key=$(/usr/bin/weaver genkey 2>/dev/null)
+	if [ -z "$key" ]; then
+		echo "weaver: 'weaver genkey' failed; will retry on next boot" >&2
+		exit 1
+	fi
+	uci -q set weaver.main.private_key="$key"
+fi
+uci -q commit weaver
+chmod 0600 /etc/config/weaver
+
+# --- network -----------------------------------------------------------------
+
+weaver_retry=0
+if [ ! -f /etc/config/network ]; then
+	# config_generate runs before uci-defaults on a real boot, so this only
+	# happens in odd setups (a bare container rootfs). Try again next boot.
+	echo "weaver: no /etc/config/network yet; the weaver interface will be added on next boot" >&2
+	weaver_retry=1
+elif [ -z "$(uci -q get network.weaver)" ]; then
+	uci -q batch <<-EOF && weaver_net_changed=1
+		set network.weaver=interface
+		set network.weaver.proto=none
+		set network.weaver.device=weaver0
+	EOF
+fi
+
+# --- firewall ----------------------------------------------------------------
+
+if [ -f /etc/config/firewall ]; then
+	if ! fw_find zone name weaver >/dev/null; then
+		uci -q batch <<-EOF
+			set firewall.weaver=zone
+			set firewall.weaver.name=weaver
+			add_list firewall.weaver.network=weaver
+			set firewall.weaver.input=ACCEPT
+			set firewall.weaver.output=ACCEPT
+			set firewall.weaver.forward=ACCEPT
+			set firewall.weaver.masq=1
+			set firewall.weaver.mtu_fix=1
+		EOF
+		weaver_fw_changed=1
+	fi
+	if ! fw_has_forwarding lan weaver; then
+		s=$(uci -q add firewall forwarding)
+		uci -q set "firewall.$s.src=lan"
+		uci -q set "firewall.$s.dest=weaver"
+		weaver_fw_changed=1
+	fi
+	if ! fw_has_forwarding weaver wan; then
+		s=$(uci -q add firewall forwarding)
+		uci -q set "firewall.$s.src=weaver"
+		uci -q set "firewall.$s.dest=wan"
+		weaver_fw_changed=1
+	fi
+	if ! fw_find rule name Allow-Weaver >/dev/null; then
+		s=$(uci -q add firewall rule)
+		uci -q batch <<-EOF
+			set firewall.$s.name=Allow-Weaver
+			set firewall.$s.src=wan
+			set firewall.$s.proto=udp
+			set firewall.$s.dest_port=$(uci -q get weaver.main.listen_port || echo 9328)
+			set firewall.$s.target=ACCEPT
+			set firewall.$s.enabled=0
+		EOF
+		weaver_fw_changed=1
+	fi
+fi
+
+[ "$weaver_net_changed" = 1 ] && uci -q commit network
+[ "$weaver_fw_changed" = 1 ] && uci -q commit firewall
+
+# Installed with opkg on a running router: netifd and the firewall must pick
+# up the new interface and zone now. On first boot netifd isn't running yet
+# (it starts after uci-defaults) and reads the committed config itself.
+if ubus list network >/dev/null 2>&1; then
+	[ "$weaver_net_changed" = 1 ] && ubus call network reload
+	[ "$weaver_fw_changed" = 1 ] && [ -x /etc/init.d/firewall ] &&
+		/etc/init.d/firewall reload >/dev/null 2>&1
+fi
+
+# Non-zero keeps this script in /etc/uci-defaults for the next boot.
+exit "$weaver_retry"

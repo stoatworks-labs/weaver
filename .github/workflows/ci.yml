@@ -1,0 +1,137 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: vet and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test ./...
+
+  packages:
+    name: binaries and ipks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # git describe needs the tags for the package version.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: cross-compile every OpenWrt architecture
+        run: scripts/build.sh
+
+      - name: build the ipks
+        run: scripts/build-ipk.sh
+
+      # opkg reads an ipk as a gzipped tar of debian-binary, data.tar.gz and
+      # control.tar.gz. GNU tar and Python's tarfile are independent readers of
+      # what build-ipk.sh wrote.
+      - name: check the ipk layout
+        run: |
+          set -eu
+          for ipk in dist/*.ipk; do
+            echo "== $ipk"
+            tar tzf "$ipk" | tee /tmp/outer
+            printf './debian-binary\n./data.tar.gz\n./control.tar.gz\n' | diff - /tmp/outer
+            tar xzOf "$ipk" ./control.tar.gz | tar tzvf -
+            tar xzOf "$ipk" ./control.tar.gz | tar xzOf - ./control
+            tar xzOf "$ipk" ./data.tar.gz | tar tzvf -
+          done
+          python3 - <<'PY'
+          import glob, io, sys, tarfile
+          bad = []
+          for ipk in glob.glob('dist/*.ipk'):
+              outer = tarfile.open(ipk, 'r:gz')
+              for name in ('./control.tar.gz', './data.tar.gz'):
+                  inner = tarfile.open(fileobj=io.BytesIO(outer.extractfile(name).read()), mode='r:gz')
+                  for m in inner.getmembers():
+                      if m.uid or m.gid or m.uname != 'root' or m.gname != 'root':
+                          bad.append(f'{ipk} {name} {m.name}: {m.uname}:{m.gname}')
+                      if not (m.name == '.' or m.name.startswith('./')):
+                          bad.append(f'{ipk} {name} {m.name}: no ./ prefix')
+          print('\n'.join(bad) or 'all entries root:root with ./ prefixes')
+          sys.exit(1 if bad else 0)
+          PY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ipk
+          path: dist/*.ipk
+          if-no-files-found: error
+
+  lint:
+    name: shell, LuCI JS, JSON
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: node --check the LuCI views
+        run: |
+          set -eu
+          for f in openwrt/luci-app-weaver/htdocs/luci-static/resources/view/weaver/*.js; do
+            node --check "$f" && echo "ok  $f"
+          done
+
+      - name: JSON parses
+        run: |
+          set -eu
+          for f in openwrt/luci-app-weaver/root/usr/share/luci/menu.d/*.json \
+                   openwrt/luci-app-weaver/root/usr/share/rpcd/acl.d/*.json; do
+            python3 -m json.tool "$f" >/dev/null && echo "ok  $f"
+          done
+
+      # The OpenWrt scripts carry "# shellcheck shell=ash" (checked as dash,
+      # which is close to busybox ash). shellcheck is preinstalled on the runner.
+      - name: shellcheck
+        run: |
+          shellcheck --version | head -2
+          shellcheck scripts/*.sh container/entrypoint.sh \
+            openwrt/weaver/files/weaver.init \
+            openwrt/weaver/files/weaver.defaults \
+            openwrt/weaver/files/weaver.hotplug \
+            openwrt/luci-app-weaver/root/usr/libexec/rpcd/luci.weaver
+
+  docker:
+    name: container image (amd64 + arm64, no push)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The Go stage cross-compiles on the runner; only the Alpine stage's
+      # apk add runs under emulation for arm64.
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha,scope=weaver
+          cache-to: type=gha,mode=max,scope=weaver

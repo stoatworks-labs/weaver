@@ -1,0 +1,23 @@
+#!/bin/sh
+# shellcheck shell=ash
+#
+# /etc/hotplug.d/iface/90-weaver: a WAN coming up (a hotel network, a modem
+# that registered late) joins the bond; one going down leaves it. The init
+# script's reload re-resolves the paths and sends weaver SIGHUP.
+# Sourced by hotplug-call with ACTION and INTERFACE set.
+#
+# This reloads whenever weaver is enabled, running or not: a client with
+# auto_paths off waits for its first path before starting, and a daemon in
+# procd's respawn pause shows as not running but must still get a fresh
+# config for its next start.
+
+case "$ACTION" in
+ifup | ifdown) ;;
+*) exit 0 ;;
+esac
+[ "$INTERFACE" = weaver ] && exit 0
+[ "$(uci -q get weaver.main.enabled)" = 1 ] || exit 0
+/etc/init.d/weaver enabled || exit 0
+
+logger -t weaver -p daemon.info "$INTERFACE $ACTION: reloading paths"
+/etc/init.d/weaver reload
